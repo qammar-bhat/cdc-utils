@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Byte-compile (syntax check all modules)
+        run: python -m compileall -q indexer main.py scripts
+
+      - name: Unit tests
+        run: python -m pytest -q
+
+      - name: Debezium generator smoke
+        env:
+          TENANT_IDS: spar,dev_env
+          SPAR_APPLICATION_DB_NAME: spar_db
+          SPAR_APPLICATION_DB_USER: u
+          SPAR_APPLICATION_DB_PASSWORD: p
+          SPAR_CDC_TOPIC_PREFIX: cdc_spar
+          DEV_ENV_APPLICATION_DB_NAME: dev_db
+          DEV_ENV_APPLICATION_DB_USER: u
+          DEV_ENV_APPLICATION_DB_PASSWORD: p
+          DEV_ENV_CDC_TOPIC_PREFIX: cdc_dev_env
+        run: python scripts/gen_debezium.py

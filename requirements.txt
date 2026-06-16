@@ -1,0 +1,24 @@
+# erpforce-indexer — PINNED deps for reproducible builds (NO langchain/langgraph/LLM SDKs).
+# Versions are the tested known-good set. Bump deliberately, re-run tests.
+# (pyproject.toml carries the same deps as ranges; this file is the lock.)
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+SQLAlchemy==2.0.49
+PyMySQL==1.1.2
+opensearch-py==3.2.0
+redis==7.4.0                       # asyncio is built-in since redis 5 (no [asyncio] extra)
+fastembed==0.8.0
+numpy==2.4.4
+logfire[fastapi]==4.29.0
+python-dotenv==1.0.1
+pydantic==2.13.4
+boto3==1.43.24                     # only used when the embedding profile is bedrock (Titan)
+
+# --- observability: Logfire (above) + Langfuse via OTLP ---
+langfuse==4.3.1
+opentelemetry-exporter-otlp-proto-http==1.39.1
+
+# --- dev / test ---
+pytest==8.4.1
+pytest-asyncio==0.24.0
+httpx==0.27.2

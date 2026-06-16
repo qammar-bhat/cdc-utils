@@ -1,0 +1,29 @@
+{
+  "_comment": "LOCK-STEP CONTRACT #1 with the hub: this embedding section MUST stay identical to the hub's src/llm_profiles.json (same embedding_profile + model + dimension). A mismatch silently breaks kNN search because vectors land in different spaces. The hub holds the LLM/chat profiles; the indexer needs embeddings only.",
+  "embedding_profile": "fastembed_default",
+  "embedding_profiles": {
+    "bedrock_titan_g1": {
+      "provider": "bedrock",
+      "model": "amazon.titan-embed-text-v1",
+      "region": "us-east-1",
+      "dimension": 1536
+    },
+    "fastembed_default": {
+      "provider": "fastembed",
+      "model": "mixedbread-ai/mxbai-embed-large-v1",
+      "dimension": 1024
+    },
+    "openai_small": {
+      "provider": "openai",
+      "model": "text-embedding-3-small",
+      "api_key_env": "OPENAI_API_KEY",
+      "dimension": 1536
+    },
+    "openai_large": {
+      "provider": "openai",
+      "model": "text-embedding-3-large",
+      "api_key_env": "OPENAI_API_KEY",
+      "dimension": 3072
+    }
+  }
+}

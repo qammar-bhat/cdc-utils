@@ -1,0 +1,46 @@
+# erpforce-indexer — standalone CDC/indexing service.
+#
+# INDEPENDENT of the erpforce-ai-hub-v2 repo. It connects to Redis / OpenSearch /
+# MySQL purely by hostname:port from .env — it does NOT join the hub's compose
+# project or reference any hub container/network by name.
+#
+# Networking, two modes (set in .env):
+#   1. Shared infra (prod / shared dev): the infra lives on an existing Docker
+#      network. Attach to it by name:
+#          INFRA_NETWORK=<that_network>     INFRA_NETWORK_EXTERNAL=true
+#      and point REDIS_URL / OPENSEARCH_HOST / *_APPLICATION_DB_HOST at the infra
+#      service hostnames on that network.
+#   2. Remote infra (managed Redis/OpenSearch/MySQL reachable by DNS/IP): leave
+#      INFRA_NETWORK unset (own bridge) and set the *_HOST/REDIS_URL env to the
+#      reachable addresses.
+#
+# Debezium (the CDC producer) is owned by THIS repo — generate per-tenant
+# services with `python scripts/gen_debezium.py`, then bring both up:
+#   docker compose -f docker-compose.yaml -f docker-compose.debezium.yml up -d
+
+services:
+  indexer:
+    build: .
+    image: erpforce-indexer:${SERVICE_VERSION:-latest}
+    ports:
+      - "${INDEXER_PORT:-8090}:8090"
+    env_file:
+      - .env
+    restart: unless-stopped
+    # Resource caps (docker compose / non-swarm). Override in .env if needed.
+    mem_limit: ${INDEXER_MEM_LIMIT:-2g}
+    mem_reservation: ${INDEXER_MEM_RESERVATION:-1g}
+    cpus: ${INDEXER_CPUS:-2}
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8090/health', timeout=5).status==200 else 1)\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 90s   # first boot downloads/loads the embedding model
+    networks:
+      - default
+
+networks:
+  default:
+    name: ${INFRA_NETWORK:-cdc_default}
+    external: ${INFRA_NETWORK_EXTERNAL:-false}
