@@ -8,6 +8,8 @@ from indexer.tenants import (
     TenantConfigError,
     UnknownTenantError,
     all_tenants,
+    debezium_group_id,
+    debezium_host_groups,
     get_tenant,
     get_tenant_by_topic_prefix,
     _load_tenants,
@@ -69,5 +71,47 @@ def test_routing_collision_raises(monkeypatch):
         monkeypatch.setenv(f"{cid}_APPLICATION_DB_USER", "u")
         monkeypatch.setenv(f"{cid}_APPLICATION_DB_PASSWORD", "p")
         monkeypatch.setenv(f"{cid}_CDC_TOPIC_PREFIX", "cdc_same")
+    with pytest.raises(TenantConfigError):
+        _load_tenants()
+
+
+def test_debezium_group_id_is_stable_and_slugified():
+    assert debezium_group_id("mysql", 3306) == "mysql_3306"
+    assert debezium_group_id("My-Host.internal", 3307) == "my_host_internal_3307"
+
+
+def test_debezium_group_id_handles_ip_host():
+    """An IP host must not produce a digit-leading id — ${VAR} interpolation
+    in docker-compose requires env var names to start with a letter/underscore."""
+    gid = debezium_group_id("13.232.229.242", 3306)
+    assert not gid[0].isdigit()
+    assert gid == "host_13_232_229_242_3306"
+
+
+def test_host_sharing_tenants_grouped_together(monkeypatch):
+    """Tenants on the same (db_host, db_port) share one Debezium instance."""
+    monkeypatch.setenv("TENANT_IDS", "aa,bb")
+    for cid, db_name in (("AA", "a_db"), ("BB", "b_db")):
+        monkeypatch.setenv(f"{cid}_APPLICATION_DB_HOST", "shared-mysql")
+        monkeypatch.setenv(f"{cid}_APPLICATION_DB_NAME", db_name)
+        monkeypatch.setenv(f"{cid}_APPLICATION_DB_USER", "u")
+        monkeypatch.setenv(f"{cid}_APPLICATION_DB_PASSWORD", "p")
+        monkeypatch.setenv(f"{cid}_CDC_TOPIC_PREFIX", "cdc_shared")  # must match across the group
+    import indexer.tenants as t
+    t._tenants = None
+    groups = debezium_host_groups()
+    gid = debezium_group_id("shared-mysql", 3306)
+    assert {cfg.client_id for cfg in groups[gid]} == {"aa", "bb"}
+
+
+def test_host_sharing_tenants_require_same_topic_prefix(monkeypatch):
+    """A connector has one topic.prefix, so co-located tenants can't diverge."""
+    monkeypatch.setenv("TENANT_IDS", "aa,bb")
+    for cid, db_name, prefix in (("AA", "a_db", "cdc_aa"), ("BB", "b_db", "cdc_bb")):
+        monkeypatch.setenv(f"{cid}_APPLICATION_DB_HOST", "shared-mysql")
+        monkeypatch.setenv(f"{cid}_APPLICATION_DB_NAME", db_name)
+        monkeypatch.setenv(f"{cid}_APPLICATION_DB_USER", "u")
+        monkeypatch.setenv(f"{cid}_APPLICATION_DB_PASSWORD", "p")
+        monkeypatch.setenv(f"{cid}_CDC_TOPIC_PREFIX", prefix)
     with pytest.raises(TenantConfigError):
         _load_tenants()

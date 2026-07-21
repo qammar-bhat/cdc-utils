@@ -22,10 +22,16 @@ Removing a client:  drop from TENANT_IDS + restart (their data stays until
 The registry fails fast: a client listed in TENANT_IDS with missing required
 vars raises at import time, so a half-configured tenant can never serve traffic.
 
+Tenants sharing a physical (db_host, db_port) share ONE Debezium Server
+instance (one connector = one binlog stream), so they MUST also share the
+same CDC_TOPIC_PREFIX — enforced here at load time. See debezium_host_groups().
+
 Public API:
     get_tenant(client_id) -> TenantConfig      raises UnknownTenantError
     all_tenants()         -> list[TenantConfig]
     get_tenant_by_topic_prefix(prefix) -> TenantConfig | None
+    debezium_group_id(db_host, db_port) -> str          stable id for a host's Debezium instance
+    debezium_host_groups() -> dict[str, list[TenantConfig]]   tenants grouped by Debezium instance
     CLIENT_ID_RE                               validation regex (shared with routes)
     TENANT_CLAIM_STRICT                        reject JWTs without client_id claim
 """
@@ -34,6 +40,7 @@ from __future__ import annotations
 
 import os
 import re
+from collections import defaultdict
 from dataclasses import dataclass
 
 from dotenv import load_dotenv
@@ -150,6 +157,27 @@ def _load_tenants() -> dict[str, TenantConfig]:
         seen_routing[routing_key] = client_id
         tenants[client_id] = cfg
 
+    # Debezium reads one MySQL server's binlog per connector instance, so
+    # tenants sharing a physical (db_host, db_port) share ONE Debezium Server
+    # container (see debezium_host_groups()) instead of one each. That container
+    # has exactly one topic.prefix, so every tenant on the same host must agree
+    # on cdc_topic_prefix — otherwise CDC stream routing would be ambiguous.
+    prefix_by_host: dict[tuple[str, int], tuple[str, str]] = {}
+    for cfg in tenants.values():
+        host_key = (cfg.db_host, cfg.db_port)
+        if host_key not in prefix_by_host:
+            prefix_by_host[host_key] = (cfg.cdc_topic_prefix, cfg.client_id)
+            continue
+        existing_prefix, existing_client = prefix_by_host[host_key]
+        if existing_prefix != cfg.cdc_topic_prefix:
+            raise TenantConfigError(
+                f"Tenants '{existing_client}' and '{cfg.client_id}' share DB host "
+                f"{cfg.db_host}:{cfg.db_port} but have different CDC topic prefixes "
+                f"({existing_prefix!r} vs {cfg.cdc_topic_prefix!r}). Tenants on the same "
+                f"physical host share one Debezium instance and must use the same "
+                f"CDC_TOPIC_PREFIX value."
+            )
+
     return tenants
 
 
@@ -182,3 +210,35 @@ def get_tenant_by_topic_prefix(prefix: str) -> TenantConfig | None:
         if cfg.cdc_topic_prefix == prefix:
             return cfg
     return None
+
+
+def debezium_group_id(db_host: str, db_port: int) -> str:
+    """Stable id for the Debezium instance covering (db_host, db_port).
+
+    Debezium reads one MySQL server's binlog per connector instance, so
+    tenants sharing a physical host share one Debezium Server container named
+    from this id. Used for both container/volume naming (gen_debezium.py) and
+    health-check URLs (indexer/api.py) — they must derive the identical id
+    from the same (db_host, db_port), or the health check probes a container
+    that doesn't exist.
+    """
+    slug = re.sub(r"[^a-z0-9]+", "_", db_host.lower()).strip("_")
+    # An IP-address host (e.g. "13.232.229.242") slugifies to a leading digit,
+    # which Docker Compose's ${VAR} interpolation can't reference (env var
+    # names must start with a letter or underscore) — prefix it so the
+    # derived {GROUP_ID}_CDC_DB_USER/PASSWORD names stay valid.
+    if not slug or slug[0].isdigit():
+        slug = f"host_{slug}"
+    return f"{slug}_{db_port}"
+
+
+def debezium_host_groups() -> dict[str, list[TenantConfig]]:
+    """All tenants grouped by the Debezium instance that serves their DB host.
+
+    Key is the same id debezium_group_id() would produce for that group's
+    (db_host, db_port) — one Debezium Server container per group, not per tenant.
+    """
+    groups: dict[str, list[TenantConfig]] = defaultdict(list)
+    for cfg in all_tenants():
+        groups[debezium_group_id(cfg.db_host, cfg.db_port)].append(cfg)
+    return dict(groups)

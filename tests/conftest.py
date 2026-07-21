@@ -10,11 +10,16 @@ import os
 import sys
 
 # Two tenants — same db name on purpose, distinct topic prefixes (the collision
-# case the routing model must survive).
+# case the routing model must survive). Distinct DB hosts so this doesn't also
+# trip the "tenants sharing a host must share a topic prefix" rule (that rule
+# is exercised separately in test_tenants.py).
 os.environ["TENANT_IDS"] = "spar,dev_env"
 
-for cid, prefix in (("SPAR", "cdc_spar"), ("DEV_ENV", "cdc_dev_env")):
-    os.environ.setdefault(f"{cid}_APPLICATION_DB_HOST", "127.0.0.1")
+for cid, prefix, host in (
+    ("SPAR", "cdc_spar", "127.0.0.1"),
+    ("DEV_ENV", "cdc_dev_env", "127.0.0.2"),
+):
+    os.environ.setdefault(f"{cid}_APPLICATION_DB_HOST", host)
     os.environ.setdefault(f"{cid}_APPLICATION_DB_NAME", "shared_db")
     os.environ.setdefault(f"{cid}_APPLICATION_DB_USER", "test")
     os.environ.setdefault(f"{cid}_APPLICATION_DB_PASSWORD", "test")

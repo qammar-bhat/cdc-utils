@@ -28,14 +28,17 @@ jobs:
         run: python -m pytest -q
 
       - name: Debezium generator smoke
+        # spar + dev_env share a DB host here (both default to APPLICATION_DB_HOST=localhost),
+        # so they MUST share one CDC_TOPIC_PREFIX — one Debezium instance = one topic.prefix.
+        # See indexer/tenants.py's host-group validation.
         env:
           TENANT_IDS: spar,dev_env
           SPAR_APPLICATION_DB_NAME: spar_db
           SPAR_APPLICATION_DB_USER: u
           SPAR_APPLICATION_DB_PASSWORD: p
-          SPAR_CDC_TOPIC_PREFIX: cdc_spar
+          SPAR_CDC_TOPIC_PREFIX: cdc_localhost_smoke
           DEV_ENV_APPLICATION_DB_NAME: dev_db
           DEV_ENV_APPLICATION_DB_USER: u
           DEV_ENV_APPLICATION_DB_PASSWORD: p
-          DEV_ENV_CDC_TOPIC_PREFIX: cdc_dev_env
+          DEV_ENV_CDC_TOPIC_PREFIX: cdc_localhost_smoke
         run: python scripts/gen_debezium.py

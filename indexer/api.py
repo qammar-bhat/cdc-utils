@@ -32,7 +32,7 @@ from indexer.indexing import indexer
 from indexer.models import SyncJobResponse, SyncJobStatus, SyncRequest
 from indexer.os_client import get_opensearch_client
 from indexer.registry.overrides import resolve_registry
-from indexer.tenants import UnknownTenantError, all_tenants, get_tenant
+from indexer.tenants import UnknownTenantError, all_tenants, debezium_host_groups, get_tenant
 from indexer.tracing import trace_context
 
 router = APIRouter()
@@ -175,9 +175,13 @@ async def health() -> dict:
     alive = cdc_consumer._thread is not None and cdc_consumer._thread.is_alive()
     checks["cdc_consumer"] = "alive" if alive else "stopped"
 
-    # Per-tenant Debezium liveness — Quarkus readiness reflects connector state,
-    # so a stuck producer (e.g. the binlog-purged "Error 1236" loop, which emits
-    # ZERO events and is otherwise invisible from the consumer side) shows up here.
+    # Debezium liveness — Quarkus readiness reflects connector state, so a stuck
+    # producer (e.g. the binlog-purged "Error 1236" loop, which emits ZERO
+    # events and is otherwise invisible from the consumer side) shows up here.
+    # One Debezium instance covers every tenant on the same physical DB host
+    # (see debezium_host_groups()), so it's probed once per host-group and the
+    # single result is fanned out to every member tenant's client_id key —
+    # keeps the existing per-tenant JSON shape without redundant duplicate pings.
     # Skipped when DEBEZIUM_HEALTH_CHECK is disabled (e.g. Debezium managed elsewhere).
     dbz_status: dict[str, str] = {}
     if os.environ.get("DEBEZIUM_HEALTH_CHECK", "true").lower() in ("1", "true", "yes"):
@@ -185,20 +189,22 @@ async def health() -> dict:
 
         tmpl = os.environ.get(
             "DEBEZIUM_HEALTH_URL_TEMPLATE",
-            "http://debezium-{client_id}:8080/q/health/ready",
+            "http://debezium-{group_id}:8080/q/health/ready",
         )
 
         def _dbz_ping(url):
             with urllib.request.urlopen(url, timeout=5) as r:
                 return r.status == 200
 
-        for tenant in all_tenants():
-            url = tmpl.format(client_id=tenant.client_id)
+        for group_id, members in debezium_host_groups().items():
+            url = tmpl.format(group_id=group_id)
             try:
                 ok = await loop.run_in_executor(None, _dbz_ping, url)
-                dbz_status[tenant.client_id] = "ok" if ok else "down"
+                result = "ok" if ok else "down"
             except Exception as exc:
-                dbz_status[tenant.client_id] = f"unreachable: {exc}"
+                result = f"unreachable: {exc}"
+            for tenant in members:
+                dbz_status[tenant.client_id] = result
         checks["debezium"] = dbz_status
 
     # Per-tenant CDC stream lag — sum of group-unread + pending across that

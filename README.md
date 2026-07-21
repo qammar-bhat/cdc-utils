@@ -16,7 +16,7 @@ cdc-utils/
 ├── llm_profiles.json       # embedding profile ONLY (LOCK-STEP CONTRACT #1 with the hub)
 ├── requirements.txt / pyproject.toml
 ├── Dockerfile / docker-compose.yaml   # standalone; connects to infra by address from .env
-├── scripts/gen_debezium.py            # renders one Debezium Server per tenant
+├── scripts/gen_debezium.py            # renders one Debezium Server per physical DB host
 ├── .env.example
 ├── indexer/
 │   ├── tenants.py          # tenant registry (TENANT_IDS + {ID}_APPLICATION_DB_*)
@@ -89,18 +89,23 @@ the embedding profile (LOCK-STEP CONTRACT #1) and the `doc_type→module` map.
 
 ## CDC pipeline (Debezium owned here)
 
-One **Debezium Server per tenant** (`topic.prefix=cdc_{client_id}`), generated
-from `TENANT_IDS` + the indexer registry so captured tables can't drift from
-indexed tables:
+One **Debezium Server per physical DB host**, not per tenant — Debezium reads
+one MySQL server's binlog per connector instance, so tenants sharing a
+`(db_host, db_port)` share ONE instance instead of one each (a tenant on its
+own dedicated host still gets its own). Generated from `TENANT_IDS` + the
+indexer registry so captured tables can't drift from indexed tables:
 
 ```bash
 python scripts/gen_debezium.py        # → docker-compose.debezium.yml
 docker compose -f docker-compose.yaml -f docker-compose.debezium.yml up -d
 ```
 
-Stream key is `{topic_prefix}.{db_name}.{table}`; the consumer maps it back to
-the tenant by prefix (db names collide across clients). Consumer group:
-`smart-search-cdc`. See [debezium/README.md](debezium/README.md).
+Co-located tenants MUST share the same `CDC_TOPIC_PREFIX` (one connector, one
+`topic.prefix`) — enforced at boot in `indexer/tenants.py`. Stream key is
+`{topic_prefix}.{db_name}.{table}`; the consumer maps it back to the tenant by
+`(topic_prefix, db_name)` (db names collide across clients, prefixes don't
+within a group). Consumer group: `smart-search-cdc`. See
+[debezium/README.md](debezium/README.md).
 
 ## Observability (Logfire + Langfuse)
 
@@ -122,9 +127,10 @@ API/LLM split. Set the env keys in `.env` (see `.env.example`).
 - **Auth:** `INDEXER_API_KEY` required (fails closed if unset). `/` and the sync
   routes are gated; `/health` is open for orchestration probes.
 - **Health (`GET /health`):** OpenSearch ping, per-tenant DB ping, consumer
-  thread, **per-tenant Debezium readiness**, and **per-tenant CDC lag**. A down
-  Debezium reports `degraded` (alert-worthy) without marking the indexer
-  unhealthy. Status is `ok` / `degraded` / `unhealthy`.
+  thread, **Debezium readiness** (probed once per DB-host group, fanned out to
+  every tenant on that host), and **per-tenant CDC lag**. A down Debezium
+  reports `degraded` (alert-worthy) without marking the indexer unhealthy.
+  Status is `ok` / `degraded` / `unhealthy`.
 - **Embedding-dimension drift guard:** at startup the live index vector dimension
   is compared to the model's; a mismatch logs a loud `ERROR` (kNN would be silently broken).
 - **CDC consumer is supervised:** a session is kept alive across ANY failure,
@@ -134,7 +140,7 @@ API/LLM split. Set the env keys in `.env` (see `.env.example`).
 - **Reproducible builds:** dependencies are pinned (`requirements.txt`); the
   embedding model is baked into the image before source copy (cached across code changes).
 - **Resource caps:** `mem_limit` / `cpus` on the indexer and every Debezium
-  (override via `*_MEM_LIMIT` / `*_CPUS` env).
+  host-group instance (override via `*_MEM_LIMIT` / `*_CPUS` env).
 - **Container health + restart:** compose `healthcheck` + `restart: unless-stopped`
   on the indexer and every Debezium instance.
 - **CI:** `.github/workflows/ci.yml` — byte-compile + pytest + generator smoke on every PR.
@@ -142,23 +148,27 @@ API/LLM split. Set the env keys in `.env` (see `.env.example`).
 ## Runbook — Debezium stuck ("Error 1236", captures nothing)
 
 Symptom: a table change never appears in OpenSearch; the stream
-`cdc_<tenant>.<db>.<table>` stays empty; Debezium logs
+`<topic_prefix>.<db>.<table>` stays empty; Debezium logs
 `Could not find first log file name in binary log index file (Error 1236)`.
 
 Cause: MySQL purged the binlog past Debezium's saved offset (downtime >
 `binlog_expire_logs_seconds`, or a DB restore). Debezium can't resume.
 
-Fix (reset that tenant's Debezium offset; it resumes at the current binlog tail):
+Find the DB-host group id this tenant belongs to (also printed by
+`gen_debezium.py` and derivable from `debezium_group_id(db_host, db_port)` in
+`indexer/tenants.py`), then reset **that instance's** offset — this affects
+**every tenant sharing the host**, since one connector = one binlog position:
 
 ```bash
-docker compose -f docker-compose.debezium.yml stop debezium-<tenant>
-docker run --rm -v <project>_debezium_<tenant>_data:/data alpine \
+docker compose -f docker-compose.debezium.yml stop debezium-<group_id>
+docker run --rm -v <project>_debezium_<group_id>_data:/data alpine \
   rm -f /data/offsets.dat /data/schema-history.dat
-docker compose -f docker-compose.debezium.yml start debezium-<tenant>
+docker compose -f docker-compose.debezium.yml start debezium-<group_id>
 ```
 
 With `DEBEZIUM_SNAPSHOT_MODE=no_data` it resumes from *now* (no backfill); run
-`POST /{tenant}/sync {"full_reindex": true}` to backfill existing rows.
+`POST /{tenant}/sync {"full_reindex": true}` for **every tenant on that host**
+to backfill existing rows.
 
 **Prevent recurrence:** set MySQL `binlog_expire_logs_seconds` larger than your
 worst-case Debezium downtime (≥7 days recommended), and watch `/health`
@@ -169,6 +179,6 @@ worst-case Debezium downtime (≥7 days recommended), and watch `/health`
 ```bash
 pip install -e ".[dev]"
 pytest                                  # unit tests run with no live infra
-python scripts/gen_debezium.py          # render per-tenant Debezium compose
+python scripts/gen_debezium.py          # render per-DB-host Debezium compose
 uvicorn main:app --host 0.0.0.0 --port 8090
 ```

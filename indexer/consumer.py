@@ -106,8 +106,8 @@ class CDCConsumer:
             try:
                 self._run_session()
             except Exception:
-                logger.exception(
-                    "CDC consumer session crashed — restarting in %ss", _RECONNECT_DELAY_S
+                logfire.exception(
+                    "CDC consumer session crashed — restarting", delay_s=_RECONNECT_DELAY_S
                 )
                 self._stop.wait(_RECONNECT_DELAY_S)
 
@@ -132,15 +132,21 @@ class CDCConsumer:
             while not self._stop.is_set():
                 iteration += 1
                 if iteration % _LAG_CHECK_EVERY == 0:
-                    for stream in streams:
-                        depth = r.xlen(stream)
-                        if depth > _LAG_WARN_THRESHOLD:
-                            logfire.warning(
-                                "indexer CDC stream backlog high",
-                                stream=stream,
-                                depth=depth,
-                                threshold=_LAG_WARN_THRESHOLD,
-                            )
+                    try:
+                        for stream in streams:
+                            depth = r.xlen(stream)
+                            if depth > _LAG_WARN_THRESHOLD:
+                                logfire.warning(
+                                    "indexer CDC stream backlog high",
+                                    stream=stream,
+                                    depth=depth,
+                                    threshold=_LAG_WARN_THRESHOLD,
+                                )
+                    except redis.exceptions.RedisError:
+                        # A blip here (e.g. a momentary connection error) is not
+                        # worth crashing the whole session over — the depth check
+                        # is diagnostic only, not on the critical read/dispatch path.
+                        logfire.warning("CDC lag check failed — skipping this round")
                 try:
                     # Drain pending (unacknowledged) messages from a previous crash
                     # Only check every _PENDING_CHECK_EVERY iterations to avoid 45+ Redis
@@ -215,7 +221,9 @@ class CDCConsumer:
                     # Loop again immediately; no traceback, no penalty sleep.
                     logger.debug("CDC read timed out (no events / slow redis) — continuing")
                 except Exception:
-                    logger.exception("CDC consumer error — retrying in %ss", _RECONNECT_DELAY_S)
+                    logfire.exception(
+                        "CDC consumer error — retrying", delay_s=_RECONNECT_DELAY_S
+                    )
                     time.sleep(_RECONNECT_DELAY_S)
                     # Rebuild the client so a poisoned connection pool (stale
                     # sockets, DNS that resolved mid-flight) can't wedge the loop.

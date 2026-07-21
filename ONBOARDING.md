@@ -38,14 +38,26 @@ ACME_APPLICATION_DB_USER=application_db   # READ-ONLY user the indexer queries w
 ACME_APPLICATION_DB_PASSWORD=<secret>
 ACME_APPLICATION_DB_POOL_SIZE=3
 ACME_APPLICATION_DB_MAX_OVERFLOW=7
-ACME_CDC_TOPIC_PREFIX=cdc_acme            # MUST be unique across tenants
-ACME_CDC_DB_USER=debezium                 # DEBEZIUM user (replication grants, see step 2)
-ACME_CDC_DB_PASSWORD=<secret>
+ACME_CDC_TOPIC_PREFIX=cdc_acme            # see note below — depends on host sharing
 ```
 
 The tenant registry **fails fast** at startup if any required var is missing — a
-half-configured tenant can never serve traffic. `*_CDC_TOPIC_PREFIX` must be
-unique: the registry refuses two tenants that share `(topic_prefix, db_name)`.
+half-configured tenant can never serve traffic.
+
+**`CDC_TOPIC_PREFIX` depends on whether this tenant shares a DB host:**
+
+- **Colocating on an existing host** (e.g. another tenant already uses
+  `ACME_APPLICATION_DB_HOST=mysql`) — one Debezium instance serves the whole
+  host, so `ACME_CDC_TOPIC_PREFIX` **must equal** the value the other tenant(s)
+  on that host already use. A mismatch raises `TenantConfigError` at boot. You
+  do **not** need new `CDC_DB_USER`/`CDC_DB_PASSWORD` vars — the existing
+  host-group credential already covers it (just grant it `SELECT` on
+  `acme_prod` too, see step 2).
+- **A new, dedicated host** — pick any prefix unique from every other host
+  group's prefix, and add group-scoped credentials (see step 2) for the new
+  group.
+
+Either way, `(topic_prefix, db_name)` as a pair must stay unique across all tenants.
 
 ## 2. MySQL prerequisites (on the client's database)
 
@@ -55,10 +67,20 @@ unique: the registry refuses two tenants that share `(topic_prefix, db_name)`.
   binlog_row_image=FULL
   ```
 - A Debezium user with replication rights:
-  ```sql
-  CREATE USER 'debezium'@'%' IDENTIFIED BY '<secret>';
-  GRANT REPLICATION SLAVE, REPLICATION CLIENT, SELECT ON *.* TO 'debezium'@'%';
-  ```
+  - **Colocating on an existing host** — the host's existing Debezium user
+    already has `REPLICATION SLAVE`/`REPLICATION CLIENT` globally; just extend
+    its `SELECT` grant to the new database:
+    ```sql
+    GRANT SELECT ON acme_prod.* TO 'debezium'@'%';
+    ```
+  - **New dedicated host** — create the user and set
+    `{GROUP_ID}_CDC_DB_USER` / `{GROUP_ID}_CDC_DB_PASSWORD` in `.env`
+    (`GROUP_ID` = `debezium_group_id(db_host, db_port)` from `indexer/tenants.py`,
+    e.g. `mysql_3306`):
+    ```sql
+    CREATE USER 'debezium'@'%' IDENTIFIED BY '<secret>';
+    GRANT REPLICATION SLAVE, REPLICATION CLIENT, SELECT ON *.* TO 'debezium'@'%';
+    ```
 - **Binlog retention longer than worst-case Debezium downtime**
   (`binlog_expire_logs_seconds >= 604800`, i.e. 7 days). If binlogs are purged
   past Debezium's saved offset it gets stuck on `Error 1236` and silently captures
@@ -93,9 +115,12 @@ what each tenant overrode/dropped/added, and warns on a likely typo'd table name
 python scripts/gen_debezium.py
 ```
 
-Re-reads `TENANT_IDS` + the registry and writes `docker-compose.debezium.yml`
-with a new `debezium-acme` service: unique `server.id`, its own offset/schema
-volume, and exactly `acme`'s resolved table set.
+Re-reads `TENANT_IDS` + the registry and rewrites `docker-compose.debezium.yml`.
+If `acme` colocates on an existing host, its tables are folded into that
+host's existing `debezium-<group_id>` service (no new container) — check the
+script's printed output to confirm `acme` shows up under the right group. If
+it's on a new dedicated host, a new `debezium-<group_id>` service appears with
+its own `server.id` and offset/schema volume.
 
 ## 5. Bring it up
 
@@ -104,10 +129,13 @@ docker compose -f docker-compose.yaml -f docker-compose.debezium.yml up -d
 ```
 
 - The indexer is **recreated** (because `.env` changed) → it reloads the tenant
-  registry and rebuilds the CDC consumer's stream map to subscribe to `cdc_acme.*`.
+  registry and rebuilds the CDC consumer's stream map to subscribe to
+  `<acme's topic_prefix>.acme_prod.*`.
 - On boot, lifespan auto-creates `acme_account`, `acme_sales`, … indices + the
   search pipeline.
-- `debezium-acme` starts tailing acme's binlog → live changes flow immediately.
+- The host-group's Debezium instance starts tailing `acme_prod`'s tables (or
+  keeps tailing, if colocated on an already-running host) → live changes flow
+  immediately.
 
 ## 6. Backfill existing rows
 
@@ -130,7 +158,7 @@ curl -s http://localhost:8090/acme/sync/status/<job_id> -H "X-Indexer-Key: $INDE
 ## 7. Verify
 
 ```bash
-# health: acme's DB ping + debezium-acme readiness should be "ok"
+# health: acme's DB ping + its host-group's debezium readiness should be "ok"
 curl -s http://localhost:8090/health -H "X-Indexer-Key: $INDEXER_API_KEY"
 
 # spot-check an index has docs
@@ -146,15 +174,21 @@ it appears in `acme_<module>` (watch the indexer log for
 ## Removing a tenant
 
 Drop the id from `TENANT_IDS`, regenerate Debezium, and `up -d`. Their data and
-indices remain until manually deleted (removal is reversible). Optionally delete
-`acme_*` indices and the `debezium_acme_data` volume to reclaim space.
+indices remain until manually deleted (removal is reversible). If they were the
+**last** tenant on their DB host, that host's `debezium-<group_id>` service
+disappears from the regenerated compose file — optionally delete the
+`debezium_<group_id>_data` volume to reclaim space (only if no other tenant
+still shares that host). Also delete the `acme_*` indices if reclaiming space.
 
 ## Common pitfalls
 
-- **Duplicate `CDC_TOPIC_PREFIX`** → startup error. Keep it unique per tenant.
+- **Mismatched `CDC_TOPIC_PREFIX` on a shared host** → startup error (tenants on
+  the same host must agree, since one connector has one `topic.prefix`).
 - **Forgot to restart the indexer** → new streams aren't consumed (the stream map
   is built at startup).
 - **No backfill** → only post-onboarding changes appear; run `POST /<id>/sync`.
-- **Debezium user lacks `REPLICATION` grants** → `debezium-<id>` crash-loops; check
-  `docker logs debezium-<id>`.
-- **Binlog retention too short** → `Error 1236` after any downtime; see README runbook.
+- **Debezium user lacks `REPLICATION`/`SELECT` grants** → `debezium-<group_id>`
+  crash-loops for **every tenant on that host**, not just the new one; check
+  `docker logs debezium-<group_id>`.
+- **Binlog retention too short** → `Error 1236` after any downtime, breaking
+  CDC for every tenant on that host; see README runbook.
